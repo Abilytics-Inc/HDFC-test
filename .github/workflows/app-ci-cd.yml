@@ -1,0 +1,178 @@
+name: docker-build-deploy
+on:
+  workflow_dispatch:
+  push:
+    branches: [ '*' ]
+    paths:
+      - 'app/src/**'  # More specific path
+      - 'app/Dockerfile'
+      - 'deploy/**'
+      - '.github/workflows/app-ci-cd.yml'
+env:
+  AWS_REGION: us-east-1                   # set this to your preferred AWS region, e.g. us-west-1
+  ECR_REPOSITORY: app-6
+permissions: read-all
+
+jobs:
+  verify-infrastructure:
+    name: 'verify-prerequisites'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.IAM_ROLE }}
+        role-session-name: AWSSession
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Verify Infrastructure
+      run: |
+        aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} || exit 1
+        aws ecs describe-clusters --clusters dummy-data-generator || exit 1
+
+  build:
+    needs: verify-infrastructure
+    name: 'continuous-integration'
+    runs-on: ubuntu-latest
+    environment: development
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./app
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Generate Image Tag
+      id: tag
+      run: echo "TAG_NAME=$(date +'%Y%m%d').${{ github.run_number }}.${{ github.run_attempt }}" >> $GITHUB_ENV
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.IAM_ROLE }}
+        role-session-name: AWSSession
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR Private
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2.0.1
+      with:
+        mask-password: 'true'
+
+    - name: Build and tag docker image
+      env:
+        REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        IMAGE_TAG: ${{ env.TAG_NAME }}
+      run: docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG .
+
+    - name: Push docker image to Amazon ECR
+      env:
+        REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        IMAGE_TAG: ${{ env.TAG_NAME }}
+      run: docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
+      if: github.event_name != 'pull_request'
+
+    - name: Create output file
+      id: create-output
+      env:
+        REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        IMAGE_TAG: ${{ env.TAG_NAME }}
+      run: echo "IMAGE_ID=$REGISTRY/$REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    outputs:
+      image-id: ${{ steps.create-output.outputs.IMAGE_ID }}
+
+  deploy:
+    needs: build
+    name: 'continuous-deployment'
+    runs-on: ubuntu-latest
+    environment: development
+    env:
+      IMAGE_ID: ${{ needs.build.outputs.image-id }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./deploy
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1-node16
+      with:
+        role-to-assume: ${{ secrets.IAM_ROLE }}
+        role-session-name: AWSSession
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v1
+
+    - name: Terraform Init
+      id: init
+      run: terraform init
+
+    - name: Terraform Format
+      id: fmt
+      run: terraform fmt -check
+
+    - name: Terraform Validate
+      id: validate
+      run: terraform validate -no-color
+
+    - name: Terraform Plan
+      id: plan
+      if: github.ref != 'refs/heads/main' || github.event_name == 'pull_request'
+      run: |
+        terraform plan -no-color -input=false \
+        -var="image_tag=${{ env.IMAGE_ID }}" \
+        -out=TFplan.JSON
+      continue-on-error: true
+
+    - name: Post Terraform Plan output
+      uses: actions/github-script@v6
+      if: github.event_name == 'pull_request'
+      env:
+        PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+
+          <details><summary>Show Plan</summary>
+
+          \`\`\`\n
+          ${process.env.PLAN}
+          \`\`\`
+
+          </details>
+
+          *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })
+
+    - name: Terraform Apply
+      if: github.ref == 'refs/heads/main'
+      run: |
+        -var="image_tag=${{ env.IMAGE_ID }}"
