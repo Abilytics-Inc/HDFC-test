@@ -7,11 +7,6 @@ on:
     paths:
       - 'infra/**'
       - '.github/workflows/terraform.yml'
-  pull_request:
-    branches: ["main"]
-    paths:
-      - 'infra/**'
-      - '.github/workflows/terraform.yml'
 env:
   AWS_REGION: us-east-1                   # set this to your preferred AWS region
 permissions: read-all
@@ -66,31 +61,11 @@ jobs:
       if: github.ref != 'refs/heads/main' || github.event_name == 'pull_request'
       run: |
         terraform plan -no-color -input=false \
-        -var="ecs_secret=${{ secrets.ECS_SECRECT }}" \
         -out=TFplan.JSON
       continue-on-error: true
 
-    # Generate an Infracost diff and save it to a JSON file.
-    - name: Generate Infracost diff
-      if:  ${{ (github.event_name == 'pull_request') && (vars.INFRACOST_SCAN_TYPE  == 'tf_plan') }}
-      run: |
-        infracost diff --path=TFplan.JSON \
-                        --format=json \
-                        --out-file=/tmp/infracost.json
-
-    - name: Post Infracost estimate
-      if: github.event_name == 'pull_request'
-      run: |
-          infracost comment github --path=/tmp/infracost.json \
-                                    --repo=$GITHUB_REPOSITORY \
-                                    --github-token=${{github.token}} \
-                                    --pull-request=${{github.event.pull_request.number}} \
-                                    --show-skipped \
-                                    --behavior=update
-
     - name: Post Terraform Plan output
       uses: actions/github-script@v6
-      if: github.event_name == 'pull_request'
       env:
         PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
       with:
