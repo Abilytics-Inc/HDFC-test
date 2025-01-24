@@ -48,12 +48,6 @@ resource "aws_ecs_task_definition" "web_app" {
           value = var.region
         }
       ]
-      secrets = [
-        {
-          name      = "ecs_secret"
-          valueFrom = local.infra_output["secret_arn"]
-        }
-      ]
     }
   ])
 }
